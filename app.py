@@ -1,7 +1,7 @@
 import os
+import time
 from collections import defaultdict
 from datetime import datetime
-from itertools import zip_longest
 from pathlib import Path
 
 import streamlit as st
@@ -77,21 +77,45 @@ if "latest_pdf_path" not in st.session_state:
 
 
 # --- Helpers ---
-def pick_balanced(raw_articles, categories, limit=6):
-    """Take articles in turn from each selected category so no single topic dominates."""
+def pick_weighted(raw_articles, categories, weights, limit=6):
+    """
+    Choose up to `limit` articles across the selected categories.
+    - Every selected category that has articles gets one slot first (if there's room),
+      so no topic is ignored.
+    - Remaining slots go to categories in proportion to their learned weight
+      (higher weight = more stories), using a highest-averages split.
+    """
     buckets = defaultdict(list)
     for a in raw_articles:
         cat = a.get("category")
         if cat in categories:
             buckets[cat].append(a)
 
+    if not buckets:
+        return []
+
     picked = []
-    for group in zip_longest(*buckets.values()):
-        for a in group:
-            if a:
-                picked.append(a)
-                if len(picked) >= limit:
-                    return picked
+    taken = {cat: 0 for cat in buckets}
+
+    def weight_of(cat):
+        return max(weights.get(cat, 1.0), 0.01)
+
+    # Pass 1: one story from each category, highest weight first
+    for cat in sorted(buckets, key=weight_of, reverse=True):
+        if len(picked) >= limit:
+            return picked
+        picked.append(buckets[cat][0])
+        taken[cat] = 1
+
+    # Pass 2: hand out remaining slots proportionally to weight
+    while len(picked) < limit:
+        candidates = [c for c in buckets if taken[c] < len(buckets[c])]
+        if not candidates:
+            break
+        best = max(candidates, key=lambda c: weight_of(c) / (taken[c] + 1))
+        picked.append(buckets[best][taken[best]])
+        taken[best] += 1
+
     return picked
 
 
@@ -100,13 +124,12 @@ def record_feedback(category: str, action: str):
     updated = engine.update_weights_from_telemetry(
         [{"category": category, "action": action}]
     )
-    if updated:
-        st.toast(f"Preference saved for '{category}'", icon="✅")
+    new_weight = updated.get(category)
+    if new_weight is not None:
+        verb = "more" if action in ("read", "bookmark") else "fewer"
+        st.toast(f"Got it. You'll see {verb} '{category}' stories (weight {new_weight}).", icon="✅")
     else:
-        st.toast(
-            "No profile/topic weights found for this category, so nothing changed.",
-            icon="⚠️"
-        )
+        st.toast("Could not save your preference.", icon="⚠️")
 
 
 # --- SIDEBAR: Onboarding & Navigation ---
@@ -128,6 +151,23 @@ with st.sidebar:
         value=st.session_state.user_profile["reading_depth"]
     )
     st.session_state.user_profile["reading_depth"] = reading_depth
+
+    story_count = st.slider(
+        "Stories per edition",
+        min_value=4,
+        max_value=12,
+        value=6,
+        help="More stories means more Groq calls, so generation takes longer."
+    )
+
+    # Show what the engine has learned so far
+    with st.expander("📈 Learned interests"):
+        learned = engine.get_weights()
+        if learned:
+            for cat, w in sorted(learned.items(), key=lambda kv: kv[1], reverse=True):
+                st.write(f"{cat}: **{w}**")
+        else:
+            st.caption("No feedback yet. Use 👍 Read more / Skip on stories to teach the paper.")
 
     st.divider()
 
@@ -175,12 +215,20 @@ if generate_btn:
             synthesizer = NewsSynthesizer()
             processed_articles = []
 
-            # Balanced pick across the reader's selected categories
-            selected_articles = pick_balanced(raw_articles, user_categories, limit=6)
+            # Pick stories across topics, favouring the ones this reader engages with
+            selected_articles = pick_weighted(
+                raw_articles,
+                user_categories,
+                engine.get_weights(),
+                limit=story_count
+            )
             if not selected_articles:  # fallback if nothing matched
-                selected_articles = raw_articles[:6]
+                selected_articles = raw_articles[:story_count]
 
-            for article in selected_articles:
+            for i, article in enumerate(selected_articles):
+                if i > 0:
+                    time.sleep(1)  # small pause to stay under Groq rate limits
+
                 synthesis = synthesizer.synthesize_article(
                     article_text=f"Title: {article['title']}\nContent: {article['raw_content']}",
                     user_profile=st.session_state.user_profile
