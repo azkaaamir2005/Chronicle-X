@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -14,7 +15,7 @@ from src.ingestion.scraper import NewsIngestionPipeline
 from src.agents.synthesizer import NewsSynthesizer
 from src.pdf_engine.broadsheet_builder import BroadsheetPDFBuilder
 from src.learning.adaptive_weights import AdaptiveWeightEngine
-from src.audio.tts_engine import PaperNarrator
+from src.audio.tts_engine import PaperNarrator, AUDIO_MODES, MODE_SUMMARIES
 
 # Page Configuration (must be the first Streamlit command)
 st.set_page_config(
@@ -75,9 +76,6 @@ if "today_edition" not in st.session_state:
 
 if "latest_pdf_path" not in st.session_state:
     st.session_state.latest_pdf_path = None
-
-if "latest_audio_path" not in st.session_state:
-    st.session_state.latest_audio_path = None
 
 
 # --- Helpers ---
@@ -142,6 +140,38 @@ def get_installed_voices():
     return PaperNarrator.list_voices()
 
 
+@st.cache_resource
+def get_audio_jobs():
+    """Shared dict that holds the state of the background audio recording."""
+    return {}
+
+
+def start_audio_job(articles, voice_id, rate, mode):
+    """
+    Records the audio briefing in a background thread so the page stays usable.
+    Only plain data is passed in: Streamlit session state can't be used from threads.
+    """
+    job = {"status": "running", "done": 0, "total": 1, "path": None, "error": None}
+    get_audio_jobs()["current"] = job
+    articles_copy = [dict(a) for a in articles]
+
+    def run():
+        try:
+            narrator = PaperNarrator(voice_id=voice_id, rate=rate)
+            job["path"] = narrator.generate_audio(
+                articles_copy,
+                mode=mode,
+                progress_callback=lambda done, total: job.update(done=done, total=total),
+            )
+            job["status"] = "done"
+        except Exception as e:
+            print(f"AUDIO ERROR: {type(e).__name__}: {e}")
+            job["error"] = f"{type(e).__name__}: {e}"
+            job["status"] = "error"
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 # --- SIDEBAR: Onboarding & Navigation ---
 with st.sidebar:
     st.title("⚙️ Personalization Engine")
@@ -172,10 +202,16 @@ with st.sidebar:
 
     # Audio options (offline voices installed in Windows)
     st.subheader("🎧 Audio Briefing")
-    audio_include_dialectic = st.checkbox(
-        "Read counter-perspectives too",
+    audio_mode = st.selectbox(
+        "Audio length",
+        options=AUDIO_MODES,
+        index=AUDIO_MODES.index(MODE_SUMMARIES),
+        help="Shorter scripts record much faster. Headlines only takes a few seconds."
+    )
+    audio_auto = st.checkbox(
+        "Record audio in the background after each paper",
         value=True,
-        help="Turn off for a shorter audio briefing with summaries only."
+        help="Audio is prepared while you read, so it's ready when you want it."
     )
 
     installed_voices = get_installed_voices()
@@ -193,6 +229,7 @@ with st.sidebar:
         value=175,
         step=5
     )
+    selected_voice_id = voice_lookup.get(audio_voice_name) if audio_voice_name else None
 
     # Show what the engine has learned so far
     with st.expander("📈 Learned interests"):
@@ -272,12 +309,16 @@ if generate_btn:
                 processed_articles.append(synthesis)
 
             st.session_state.today_edition = processed_articles
-            st.session_state.latest_audio_path = None  # old audio no longer matches this edition
+            get_audio_jobs()["current"] = None  # old audio no longer matches this edition
 
             st.write("📄 Programmatically compiling Broadsheet PDF layout...")
             pdf_builder = BroadsheetPDFBuilder()
             pdf_path = pdf_builder.generate_pdf(processed_articles)
             st.session_state.latest_pdf_path = pdf_path
+
+            if audio_auto and processed_articles:
+                st.write("🎧 Recording audio briefing in the background...")
+                start_audio_job(processed_articles, selected_voice_id, audio_rate, audio_mode)
 
             status.update(label="Morning Paper Ready!", state="complete", expanded=False)
 
@@ -299,45 +340,50 @@ if st.session_state.today_edition:
                 )
 
     with audio_col:
-        audio_btn = st.button("🎧 Generate Audio Briefing")
+        audio_btn = st.button("🎧 Re-record Audio Briefing")
 
-    # Handle offline audio generation
+    # Manual (re)recording with the current sidebar settings
     if audio_btn:
-        narrator = PaperNarrator(
-            voice_id=voice_lookup.get(audio_voice_name) if audio_voice_name else None,
-            rate=audio_rate
-        )
-        progress = st.progress(0.0, text="Recording your audio briefing...")
-        try:
-            audio_path = narrator.generate_audio(
-                st.session_state.today_edition,
-                include_dialectic=audio_include_dialectic,
-                progress_callback=lambda done, total: progress.progress(
-                    done / total, text=f"Recording your audio briefing... ({done}/{total})"
-                )
+        start_audio_job(st.session_state.today_edition, selected_voice_id, audio_rate, audio_mode)
+
+    # Audio panel: polls every 2 seconds while recording, then shows the player
+    current_job = get_audio_jobs().get("current")
+    audio_running = bool(current_job and current_job["status"] == "running")
+
+    @st.fragment(run_every=2 if audio_running else None)
+    def audio_panel():
+        job = get_audio_jobs().get("current")
+        if not job:
+            return
+
+        # Recording just finished: refresh the whole page so polling stops
+        if audio_running and job["status"] != "running":
+            st.rerun()
+
+        if job["status"] == "running":
+            total = max(job["total"], 1)
+            st.progress(
+                min(job["done"] / total, 1.0),
+                text=f"🎧 Recording audio in the background ({job['done']}/{total}). You can keep reading."
             )
-            st.session_state.latest_audio_path = audio_path
-        except Exception as e:
-            print(f"AUDIO ERROR: {type(e).__name__}: {e}")
+        elif job["status"] == "error":
             st.error(
                 "Could not generate audio. Make sure pyttsx3 is installed and a Windows "
-                f"voice is available. ({type(e).__name__}: {e})"
+                f"voice is available. ({job['error']})"
             )
-        finally:
-            progress.empty()
+        elif job["status"] == "done" and job["path"] and os.path.exists(job["path"]):
+            st.markdown("**🎧 Listen to today's paper**")
+            with open(job["path"], "rb") as audio_file:
+                audio_bytes = audio_file.read()
+            st.audio(audio_bytes, format="audio/wav")
+            st.download_button(
+                label="📥 Download audio (WAV)",
+                data=audio_bytes,
+                file_name=os.path.basename(job["path"]),
+                mime="audio/wav"
+            )
 
-    # Audio player
-    if st.session_state.latest_audio_path and os.path.exists(st.session_state.latest_audio_path):
-        st.markdown("**🎧 Listen to today's paper**")
-        with open(st.session_state.latest_audio_path, "rb") as audio_file:
-            audio_bytes = audio_file.read()
-        st.audio(audio_bytes, format="audio/wav")
-        st.download_button(
-            label="📥 Download audio (WAV)",
-            data=audio_bytes,
-            file_name=os.path.basename(st.session_state.latest_audio_path),
-            mime="audio/wav"
-        )
+    audio_panel()
 
     st.divider()
 

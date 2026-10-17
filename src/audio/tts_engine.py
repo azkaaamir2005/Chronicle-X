@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import wave
 from contextlib import contextmanager
 from datetime import datetime
@@ -9,6 +10,12 @@ from datetime import datetime
 import pyttsx3
 
 from config import OUTPUTS_DIR, NEWSPAPER_NAME, NEWSPAPER_TAGLINE
+
+# Audio length modes (shorter script = much faster recording)
+MODE_HEADLINES = "Headlines only"
+MODE_SUMMARIES = "Summaries"
+MODE_FULL = "Summaries + counter-perspectives"
+AUDIO_MODES = [MODE_HEADLINES, MODE_SUMMARIES, MODE_FULL]
 
 # Characters that read badly (or not at all) when spoken
 SPEECH_REPLACEMENTS = {
@@ -32,8 +39,8 @@ SILENCE_BETWEEN_SEGMENTS_SEC = 0.5
 @contextmanager
 def _com_initialized():
     """
-    Windows speech (SAPI5) uses COM. Streamlit runs scripts in a worker thread,
-    which must initialize COM itself or pyttsx3 fails.
+    Windows speech (SAPI5) uses COM. Any non-main thread (Streamlit's worker thread,
+    or our background recording thread) must initialize COM itself.
     """
     comtypes = None
     initialized = False
@@ -93,29 +100,45 @@ class PaperNarrator:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def build_segments(self, articles: list, include_dialectic: bool = True) -> list:
-        """Builds the script as a list of short segments (one per spoken block)."""
+    def build_segments(self, articles: list, mode: str = MODE_SUMMARIES) -> list:
+        """
+        Builds the script as a short list of segments.
+        Fewer segments = fewer synthesis calls = faster recording.
+        """
         date_str = datetime.now().strftime("%A, %B %d, %Y")
         total = len(articles)
 
-        segments = [
+        intro = (
             f"Good morning. This is {self._clean(NEWSPAPER_NAME)}. "
             f"{self._clean(NEWSPAPER_TAGLINE)}. Edition for {date_str}. "
             f"Today's paper has {total} {'story' if total == 1 else 'stories'}."
-        ]
+        )
+        outro = "That concludes today's edition. Thank you for listening."
 
+        # Headlines only: one single segment, very fast
+        if mode == MODE_HEADLINES:
+            lines = [intro]
+            for i, article in enumerate(articles, start=1):
+                category = self._clean(article.get("category", "General"))
+                headline = self._clean(article.get("headline", "Untitled"))
+                lines.append(f"Story {i}. {category}. {headline}.")
+            lines.append(outro)
+            return [" ".join(lines)]
+
+        # Summaries (optionally with counter-perspectives): one segment per story
+        segments = [intro]
         for i, article in enumerate(articles, start=1):
             category = self._clean(article.get("category", "General"))
             headline = self._clean(article.get("headline", "Untitled"))
             summary = self._clean(article.get("summary", ""))
             dialectic = self._clean(article.get("dialectic_perspective", ""))
 
-            segments.append(f"Story {i} of {total}. {category}. {headline}. {summary}")
+            block = f"Story {i} of {total}. {category}. {headline}. {summary}"
+            if mode == MODE_FULL and dialectic and dialectic.lower() != "n/a":
+                block += f" The counter perspective. {dialectic}"
+            segments.append(block)
 
-            if include_dialectic and dialectic and dialectic.lower() != "n/a":
-                segments.append(f"The counter perspective. {dialectic}")
-
-        segments.append("That concludes today's edition. Thank you for listening.")
+        segments.append(outro)
         return [s for s in segments if s.strip()]
 
     # ---------- Audio generation ----------
@@ -140,7 +163,7 @@ class PaperNarrator:
     def generate_audio(
         self,
         articles: list,
-        include_dialectic: bool = True,
+        mode: str = MODE_SUMMARIES,
         filename: str = None,
         progress_callback=None,
     ) -> str:
@@ -158,11 +181,12 @@ class PaperNarrator:
         os.makedirs(OUTPUTS_DIR, exist_ok=True)
         filepath = os.path.join(OUTPUTS_DIR, filename)
 
-        segments = self.build_segments(articles, include_dialectic)
+        segments = self.build_segments(articles, mode)
         total = len(segments)
 
         tmp_dir = tempfile.mkdtemp(prefix="chroniclex_tts_")
         part_paths = []
+        started = time.perf_counter()
 
         try:
             with _com_initialized():
@@ -174,6 +198,7 @@ class PaperNarrator:
                     engine.setProperty("volume", self.volume)
 
                     for done, segment in enumerate(segments, start=1):
+                        seg_start = time.perf_counter()
                         part = os.path.join(tmp_dir, f"part_{done:03d}.wav")
                         engine.save_to_file(segment, part)
                         engine.runAndWait()
@@ -182,6 +207,11 @@ class PaperNarrator:
                             raise RuntimeError(f"Voice produced no audio for segment {done}.")
 
                         part_paths.append(part)
+                        words = len(segment.split())
+                        print(
+                            f"[audio] segment {done}/{total}: {words} words "
+                            f"in {time.perf_counter() - seg_start:.1f}s"
+                        )
                         if progress_callback:
                             progress_callback(done, total)
                 finally:
@@ -191,6 +221,7 @@ class PaperNarrator:
                         pass
 
             self._merge_wavs(part_paths, filepath)
+            print(f"[audio] finished in {time.perf_counter() - started:.1f}s -> {filepath}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
