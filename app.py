@@ -14,6 +14,7 @@ from src.ingestion.scraper import NewsIngestionPipeline
 from src.agents.synthesizer import NewsSynthesizer
 from src.pdf_engine.broadsheet_builder import BroadsheetPDFBuilder
 from src.learning.adaptive_weights import AdaptiveWeightEngine
+from src.audio.tts_engine import PaperNarrator
 
 # Page Configuration (must be the first Streamlit command)
 st.set_page_config(
@@ -75,6 +76,9 @@ if "today_edition" not in st.session_state:
 if "latest_pdf_path" not in st.session_state:
     st.session_state.latest_pdf_path = None
 
+if "latest_audio_path" not in st.session_state:
+    st.session_state.latest_audio_path = None
+
 
 # --- Helpers ---
 def pick_weighted(raw_articles, categories, weights, limit=6):
@@ -132,6 +136,12 @@ def record_feedback(category: str, action: str):
         st.toast("Could not save your preference.", icon="⚠️")
 
 
+@st.cache_data(show_spinner=False)
+def get_installed_voices():
+    """Voices installed on this computer (cached so the sidebar stays fast)."""
+    return PaperNarrator.list_voices()
+
+
 # --- SIDEBAR: Onboarding & Navigation ---
 with st.sidebar:
     st.title("⚙️ Personalization Engine")
@@ -158,6 +168,30 @@ with st.sidebar:
         max_value=12,
         value=6,
         help="More stories means more Groq calls, so generation takes longer."
+    )
+
+    # Audio options (offline voices installed in Windows)
+    st.subheader("🎧 Audio Briefing")
+    audio_include_dialectic = st.checkbox(
+        "Read counter-perspectives too",
+        value=True,
+        help="Turn off for a shorter audio briefing with summaries only."
+    )
+
+    installed_voices = get_installed_voices()
+    voice_lookup = {name: vid for vid, name in installed_voices}
+    if voice_lookup:
+        audio_voice_name = st.selectbox("Voice", options=list(voice_lookup.keys()))
+    else:
+        audio_voice_name = None
+        st.caption("No offline voices detected. The system default voice will be used.")
+
+    audio_rate = st.slider(
+        "Speech speed (words per minute)",
+        min_value=120,
+        max_value=240,
+        value=175,
+        step=5
     )
 
     # Show what the engine has learned so far
@@ -238,6 +272,7 @@ if generate_btn:
                 processed_articles.append(synthesis)
 
             st.session_state.today_edition = processed_articles
+            st.session_state.latest_audio_path = None  # old audio no longer matches this edition
 
             st.write("📄 Programmatically compiling Broadsheet PDF layout...")
             pdf_builder = BroadsheetPDFBuilder()
@@ -249,17 +284,62 @@ if generate_btn:
 
 # Display Active Morning Paper
 if st.session_state.today_edition:
-    # PDF Download Option
-    if st.session_state.latest_pdf_path and os.path.exists(st.session_state.latest_pdf_path):
-        with open(st.session_state.latest_pdf_path, "rb") as pdf_file:
-            st.download_button(
-                label="📥 Download Morning Paper PDF",
-                data=pdf_file,
-                file_name=os.path.basename(st.session_state.latest_pdf_path),
-                mime="application/pdf",
-                type="primary"
+    # PDF download + audio generation side by side
+    pdf_col, audio_col, _ = st.columns([1, 1, 2])
+
+    with pdf_col:
+        if st.session_state.latest_pdf_path and os.path.exists(st.session_state.latest_pdf_path):
+            with open(st.session_state.latest_pdf_path, "rb") as pdf_file:
+                st.download_button(
+                    label="📥 Download Morning Paper PDF",
+                    data=pdf_file,
+                    file_name=os.path.basename(st.session_state.latest_pdf_path),
+                    mime="application/pdf",
+                    type="primary"
+                )
+
+    with audio_col:
+        audio_btn = st.button("🎧 Generate Audio Briefing")
+
+    # Handle offline audio generation
+    if audio_btn:
+        narrator = PaperNarrator(
+            voice_id=voice_lookup.get(audio_voice_name) if audio_voice_name else None,
+            rate=audio_rate
+        )
+        progress = st.progress(0.0, text="Recording your audio briefing...")
+        try:
+            audio_path = narrator.generate_audio(
+                st.session_state.today_edition,
+                include_dialectic=audio_include_dialectic,
+                progress_callback=lambda done, total: progress.progress(
+                    done / total, text=f"Recording your audio briefing... ({done}/{total})"
+                )
             )
-        st.divider()
+            st.session_state.latest_audio_path = audio_path
+        except Exception as e:
+            print(f"AUDIO ERROR: {type(e).__name__}: {e}")
+            st.error(
+                "Could not generate audio. Make sure pyttsx3 is installed and a Windows "
+                f"voice is available. ({type(e).__name__}: {e})"
+            )
+        finally:
+            progress.empty()
+
+    # Audio player
+    if st.session_state.latest_audio_path and os.path.exists(st.session_state.latest_audio_path):
+        st.markdown("**🎧 Listen to today's paper**")
+        with open(st.session_state.latest_audio_path, "rb") as audio_file:
+            audio_bytes = audio_file.read()
+        st.audio(audio_bytes, format="audio/wav")
+        st.download_button(
+            label="📥 Download audio (WAV)",
+            data=audio_bytes,
+            file_name=os.path.basename(st.session_state.latest_audio_path),
+            mime="audio/wav"
+        )
+
+    st.divider()
 
     # Article Layout Grid
     for idx, article in enumerate(st.session_state.today_edition):
