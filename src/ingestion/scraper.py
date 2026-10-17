@@ -31,6 +31,30 @@ class NewsIngestionPipeline:
             "Serendipity / Wildcard": [
                 "https://www.quantamagazine.org/feed/",
                 "https://www.atlasobscura.com/feeds/latest"
+            ],
+            "Science & Health": [
+                "https://www.sciencedaily.com/rss/top/science.xml",
+                "https://feeds.bbci.co.uk/news/health/rss.xml"
+            ],
+            "Business & Startups": [
+                "https://techcrunch.com/feed/",
+                "https://www.inc.com/rss"
+            ],
+            "Climate & Environment": [
+                "https://www.theguardian.com/environment/climate-crisis/rss",
+                "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"
+            ],
+            "Politics & Policy": [
+                "https://www.theguardian.com/politics/rss",
+                "https://feeds.bbci.co.uk/news/politics/rss.xml"
+            ],
+            "Culture & Arts": [
+                "https://www.theguardian.com/culture/rss",
+                "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml"
+            ],
+            "Space & Physics": [
+                "https://www.nasa.gov/feed/",
+                "https://www.space.com/feeds/all"
             ]
         }
 
