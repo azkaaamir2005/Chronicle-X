@@ -16,7 +16,7 @@ from src.ingestion.scraper import NewsIngestionPipeline
 from src.agents.synthesizer import NewsSynthesizer
 from src.pdf_engine.broadsheet_builder import BroadsheetPDFBuilder
 from src.learning.adaptive_weights import AdaptiveWeightEngine
-from src.audio.tts_engine import PaperNarrator, AUDIO_MODES, MODE_SUMMARIES
+from src.audio.tts_engine import PaperNarrator, AUDIO_MODES, MODE_HEADLINES
 
 # Page Configuration (must be the first Streamlit command)
 st.set_page_config(
@@ -81,13 +81,6 @@ if "latest_pdf_path" not in st.session_state:
 
 # --- Helpers ---
 def pick_weighted(raw_articles, categories, weights, limit=6):
-    """
-    Choose up to `limit` articles across the selected categories.
-    - Every selected category that has articles gets one slot first (if there's room),
-      so no topic is ignored.
-    - Remaining slots go to categories in proportion to their learned weight
-      (higher weight = more stories), using a highest-averages split.
-    """
     buckets = defaultdict(list)
     for a in raw_articles:
         cat = a.get("category")
@@ -103,14 +96,12 @@ def pick_weighted(raw_articles, categories, weights, limit=6):
     def weight_of(cat):
         return max(weights.get(cat, 1.0), 0.01)
 
-    # Pass 1: one story from each category, highest weight first
     for cat in sorted(buckets, key=weight_of, reverse=True):
         if len(picked) >= limit:
             return picked
         picked.append(buckets[cat][0])
         taken[cat] = 1
 
-    # Pass 2: hand out remaining slots proportionally to weight
     while len(picked) < limit:
         candidates = [c for c in buckets if taken[c] < len(buckets[c])]
         if not candidates:
@@ -123,7 +114,6 @@ def pick_weighted(raw_articles, categories, weights, limit=6):
 
 
 def record_feedback(category: str, action: str):
-    """Send a read/skip signal to the adaptive weight engine."""
     updated = engine.update_weights_from_telemetry(
         [{"category": category, "action": action}]
     )
@@ -137,21 +127,15 @@ def record_feedback(category: str, action: str):
 
 @st.cache_data(show_spinner=False)
 def get_installed_voices():
-    """Voices installed on this computer (cached so the sidebar stays fast)."""
     return PaperNarrator.list_voices()
 
 
 @st.cache_resource
 def get_audio_jobs():
-    """Shared dict that holds the state of the background audio recording."""
     return {}
 
 
 def start_audio_job(articles, voice_id, rate, mode):
-    """
-    Records the audio briefing in a background thread so the page stays usable.
-    Only plain data is passed in: Streamlit session state can't be used from threads.
-    """
     job = {"status": "running", "done": 0, "total": 1, "path": None, "json_path": None, "error": None}
     get_audio_jobs()["current"] = job
     articles_copy = [dict(a) for a in articles]
@@ -203,18 +187,18 @@ with st.sidebar:
         help="More stories means more Groq calls, so generation takes longer."
     )
 
-    # Audio options (offline voices installed in Windows)
+    # Audio options (Optimized for instant demo headlines briefing)
     st.subheader("🎧 Audio Briefing")
     audio_mode = st.selectbox(
-        "Audio length & Scope",
+        "Audio mode",
         options=AUDIO_MODES,
-        index=AUDIO_MODES.index(MODE_SUMMARIES),
-        help="Choose whether to listen to headlines, summaries, or full counter-perspectives."
+        index=0,
+        help="Optimized for instant headline generation during live demos."
     )
     audio_auto = st.checkbox(
-        "Record audio in the background after each paper",
+        "Record audio automatically after paper generation",
         value=True,
-        help="Audio is prepared while you read, so it's ready when you want it."
+        help="Compiles the lightning-fast headline speech brief instantly."
     )
 
     installed_voices = get_installed_voices()
@@ -229,12 +213,11 @@ with st.sidebar:
         "Speech speed (words per minute)",
         min_value=120,
         max_value=240,
-        value=175,
+        value=185,
         step=5
     )
     selected_voice_id = voice_lookup.get(audio_voice_name) if audio_voice_name else None
 
-    # Show what the engine has learned so far
     with st.expander("📈 Learned interests"):
         learned = engine.get_weights()
         if learned:
@@ -250,7 +233,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Previous Editions Archive Access
     st.subheader("📁 Paper Archives")
     archive_files = sorted([f for f in os.listdir(OUTPUTS_DIR) if f.endswith(".pdf")], reverse=True)
     if archive_files:
@@ -273,7 +255,6 @@ st.markdown(f"<div class='masthead-title'>{NEWSPAPER_NAME}</div>", unsafe_allow_
 st.markdown(f"<div class='masthead-subtitle'>{NEWSPAPER_TAGLINE} &bull; {datetime.now().strftime('%A, %B %d, %Y')}</div>", unsafe_allow_html=True)
 st.divider()
 
-# Handle News Generation Pipeline
 if generate_btn:
     user_categories = st.session_state.user_profile["categories"]
 
@@ -289,30 +270,28 @@ if generate_btn:
             synthesizer = NewsSynthesizer()
             processed_articles = []
 
-            # Pick stories across topics, favouring the ones this reader engages with
             selected_articles = pick_weighted(
                 raw_articles,
                 user_categories,
                 engine.get_weights(),
                 limit=story_count
             )
-            if not selected_articles:  # fallback if nothing matched
+            if not selected_articles:
                 selected_articles = raw_articles[:story_count]
 
             for i, article in enumerate(selected_articles):
                 if i > 0:
-                    time.sleep(1)  # small pause to stay under Groq rate limits
+                    time.sleep(1)
 
                 synthesis = synthesizer.synthesize_article(
                     article_text=f"Title: {article['title']}\nContent: {article['raw_content']}",
                     user_profile=st.session_state.user_profile
                 )
-                # Keep the scraper's category instead of letting the LLM guess one
                 synthesis["category"] = article.get("category", synthesis.get("category", "General"))
                 processed_articles.append(synthesis)
 
             st.session_state.today_edition = processed_articles
-            get_audio_jobs()["current"] = None  # old audio no longer matches this edition
+            get_audio_jobs()["current"] = None
 
             st.write("📄 Programmatically compiling Broadsheet PDF layout...")
             pdf_builder = BroadsheetPDFBuilder()
@@ -320,15 +299,13 @@ if generate_btn:
             st.session_state.latest_pdf_path = pdf_path
 
             if audio_auto and processed_articles:
-                st.write("🎧 Recording audio briefing in the background...")
+                st.write("🎧 Recording snappy headline audio briefing in the background...")
                 start_audio_job(processed_articles, selected_voice_id, audio_rate, audio_mode)
 
             status.update(label="Morning Paper Ready!", state="complete", expanded=False)
 
 
-# Display Active Morning Paper
 if st.session_state.today_edition:
-    # PDF download + audio generation side by side
     pdf_col, audio_col, _ = st.columns([1, 1, 2])
 
     with pdf_col:
@@ -345,11 +322,9 @@ if st.session_state.today_edition:
     with audio_col:
         audio_btn = st.button("🎧 Re-record Audio Briefing")
 
-    # Manual (re)recording with the current sidebar settings
     if audio_btn:
         start_audio_job(st.session_state.today_edition, selected_voice_id, audio_rate, audio_mode)
 
-    # Audio panel: polls every 2 seconds while recording, then shows the player + live word highlighter
     current_job = get_audio_jobs().get("current")
     audio_running = bool(current_job and current_job["status"] == "running")
 
@@ -359,7 +334,6 @@ if st.session_state.today_edition:
         if not job:
             return
 
-        # Recording just finished: refresh the whole page so polling stops
         if audio_running and job["status"] != "running":
             st.rerun()
 
@@ -367,7 +341,7 @@ if st.session_state.today_edition:
             total = max(job["total"], 1)
             st.progress(
                 min(job["done"] / total, 1.0),
-                text=f"🎧 Recording audio in the background ({job['done']}/{total}). You can keep reading."
+                text=f"🎧 Recording headline brief ({job['done']}/{total}). You can keep reading."
             )
         elif job["status"] == "error":
             st.error(
@@ -376,21 +350,19 @@ if st.session_state.today_edition:
             )
         elif job["status"] == "done" and job["path"] and os.path.exists(job["path"]):
             st.markdown("---")
-            st.subheader("📻 ChronicleX Live Audio Briefing & Synchronized Word Highlighter")
+            st.subheader("📻 ChronicleX Live Audio Headlines & Synchronized Word Highlighter")
             
             with open(job["path"], "rb") as audio_file:
                 audio_bytes = audio_file.read()
             st.audio(audio_bytes, format="audio/wav")
 
-            # Load word timing metadata for word-level highlighting
             json_meta_path = job.get("json_path")
             if json_meta_path and os.path.exists(json_meta_path):
                 with open(json_meta_path, "r", encoding="utf-8") as jf:
                     timing_data = json.load(jf)
 
-                # Render synchronized HTML/JS text box for live word highlighting
                 highlight_html = f"""
-                <div style="background-color: #12151c; padding: 18px; border-radius: 8px; border: 1px solid #374151; max-height: 220px; overflow-y: auto; margin-top: 10px;">
+                <div style="background-color: #12151c; padding: 18px; border-radius: 8px; border: 1px solid #374151; max-height: 200px; overflow-y: auto; margin-top: 10px;">
                     <p id="transcript-box" style="font-size: 1.05em; line-height: 1.7; color: #d1d5db; font-family: monospace;">
                         {' '.join([f'<span id="w-{i}" style="transition: color 0.1s ease;">{item["word"]}</span>' for i, item in enumerate(timing_data)])}
                     </p>
@@ -406,7 +378,7 @@ if st.session_state.today_edition:
                                 const span = window.parent.document.getElementById('w-' + idx);
                                 if (span) {{
                                     if (currentTime >= t.start && currentTime <= t.end) {{
-                                        span.style.color = '#38bdf8'; // Highlight cyan color
+                                        span.style.color = '#38bdf8';
                                         span.style.fontWeight = 'bold';
                                     }} else {{
                                         span.style.color = '#d1d5db';
@@ -431,7 +403,6 @@ if st.session_state.today_edition:
 
     st.divider()
 
-    # Article Layout Grid
     for idx, article in enumerate(st.session_state.today_edition):
         col1, col2 = st.columns([1.6, 1])
         category = article.get("category", "General")
@@ -441,7 +412,6 @@ if st.session_state.today_edition:
             st.subheader(article.get("headline", "Untitled"))
             st.write(article.get("summary", ""))
 
-            # Feedback buttons -> adaptive weight engine
             btn_col1, btn_col2, _ = st.columns([1, 1, 3])
             with btn_col1:
                 if st.button("👍 Read more", key=f"read_{idx}"):

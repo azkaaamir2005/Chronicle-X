@@ -12,11 +12,9 @@ import pyttsx3
 
 from config import OUTPUTS_DIR, NEWSPAPER_NAME, NEWSPAPER_TAGLINE
 
-# Audio length modes (shorter script = much faster recording)
+# Audio length mode optimized for instant demo rendering
 MODE_HEADLINES = "Headlines only"
-MODE_SUMMARIES = "Summaries"
-MODE_FULL = "Summaries + counter-perspectives"
-AUDIO_MODES = [MODE_HEADLINES, MODE_SUMMARIES, MODE_FULL]
+AUDIO_MODES = [MODE_HEADLINES]
 
 # Characters that read badly (or not at all) when spoken
 SPEECH_REPLACEMENTS = {
@@ -34,7 +32,7 @@ SPEECH_REPLACEMENTS = {
     "%": " percent",
 }
 
-SILENCE_BETWEEN_SEGMENTS_SEC = 0.5
+SILENCE_BETWEEN_SEGMENTS_SEC = 0.3
 
 
 @contextmanager
@@ -63,11 +61,11 @@ def _com_initialized():
 
 
 class PaperNarrator:
-    """Turns a list of synthesized articles into a spoken WAV briefing with word-timing metadata, fully offline."""
+    """Turns a list of synthesized articles into a rapid headline audio briefing with word-timing metadata, fully offline."""
 
-    def __init__(self, voice_id: str = None, rate: int = 175, volume: float = 1.0):
+    def __init__(self, voice_id: str = None, rate: int = 185, volume: float = 1.0):
         self.voice_id = voice_id    # None = system default voice
-        self.rate = rate            # words per minute (~120 slow, 175 normal, 240 fast)
+        self.rate = rate            # words per minute (slightly faster for snappy demo)
         self.volume = volume        # 0.0 to 1.0
 
     # ---------- Voices ----------
@@ -101,10 +99,9 @@ class PaperNarrator:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def build_segments(self, articles: list, mode: str = MODE_SUMMARIES) -> list:
+    def build_segments(self, articles: list, mode: str = MODE_HEADLINES) -> list:
         """
-        Builds the script as a short list of segments.
-        Fewer segments = fewer synthesis calls = faster recording.
+        Builds a rapid headline-only briefing script for instant demo readiness.
         """
         date_str = datetime.now().strftime("%A, %B %d, %Y")
         total = len(articles)
@@ -112,35 +109,18 @@ class PaperNarrator:
         intro = (
             f"Good morning. This is {self._clean(NEWSPAPER_NAME)}. "
             f"{self._clean(NEWSPAPER_TAGLINE)}. Edition for {date_str}. "
-            f"Today's paper has {total} {'story' if total == 1 else 'stories'}."
+            f"Today's paper features {total} {'story' if total == 1 else 'stories'}."
         )
-        outro = "That concludes today's edition. Thank you for listening."
+        outro = "That concludes today's headline brief. Thank you for listening."
 
-        # Headlines only: one single segment, very fast
-        if mode == MODE_HEADLINES:
-            lines = [intro]
-            for i, article in enumerate(articles, start=1):
-                category = self._clean(article.get("category", "General"))
-                headline = self._clean(article.get("headline", "Untitled"))
-                lines.append(f"Story {i}. {category}. {headline}.")
-            lines.append(outro)
-            return [" ".join(lines)]
-
-        # Summaries (optionally with counter-perspectives): one segment per story
-        segments = [intro]
+        lines = [intro]
         for i, article in enumerate(articles, start=1):
             category = self._clean(article.get("category", "General"))
             headline = self._clean(article.get("headline", "Untitled"))
-            summary = self._clean(article.get("summary", ""))
-            dialectic = self._clean(article.get("dialectic_perspective", ""))
+            lines.append(f"Story {i}. {category}. {headline}.")
+        lines.append(outro)
 
-            block = f"Story {i} of {total}. {category}. {headline}. {summary}"
-            if mode == MODE_FULL and dialectic and dialectic.lower() != "n/a":
-                block += f" The counter perspective. {dialectic}"
-            segments.append(block)
-
-        segments.append(outro)
-        return [s for s in segments if s.strip()]
+        return [" ".join(lines)]
 
     # ---------- Audio generation ----------
     @staticmethod
@@ -164,12 +144,12 @@ class PaperNarrator:
     def generate_audio(
         self,
         articles: list,
-        mode: str = MODE_SUMMARIES,
+        mode: str = MODE_HEADLINES,
         filename: str = None,
         progress_callback=None,
     ) -> tuple[str, str]:
         """
-        Synthesizes briefing to WAV, generates a word-timing JSON metadata file for highlighting, 
+        Synthesizes briefing to WAV, generates a word-timing JSON metadata file for live highlighting, 
         and returns (wav_filepath, json_filepath).
         """
         if not articles:
@@ -230,7 +210,6 @@ class PaperNarrator:
                                 word_timings.append({"word": w, "start": round(start_t, 2), "end": round(end_t, 2)})
                                 current_time = end_t
 
-                        # Account for pause between segments
                         current_time += SILENCE_BETWEEN_SEGMENTS_SEC
 
                         if progress_callback:
