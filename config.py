@@ -34,7 +34,14 @@ DEFAULT_CATEGORIES = [
     "Global Economics & Geopolitics",
     "Deep Tech & Engineering",
     "Ethics, Philosophy & Society",
-    "Serendipity / Wildcard Breakthroughs"
+    "Serendipity / Wildcard Breakthroughs",
+    # New categories
+    "Science & Health",
+    "Business & Startups",
+    "Climate & Environment",
+    "Politics & Policy",
+    "Culture & Arts",
+    "Space & Physics"
 ]
 
 SERENDIPITY_RATIO = 0.15  # 15% wildcard injection to prevent echo chambers
