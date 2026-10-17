@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import time
 import wave
+import json
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -62,12 +63,12 @@ def _com_initialized():
 
 
 class PaperNarrator:
-    """Turns a list of synthesized articles into a spoken WAV briefing, fully offline."""
+    """Turns a list of synthesized articles into a spoken WAV briefing with word-timing metadata, fully offline."""
 
     def __init__(self, voice_id: str = None, rate: int = 175, volume: float = 1.0):
-        self.voice_id = voice_id   # None = system default voice
-        self.rate = rate           # words per minute (~120 slow, 175 normal, 240 fast)
-        self.volume = volume       # 0.0 to 1.0
+        self.voice_id = voice_id    # None = system default voice
+        self.rate = rate            # words per minute (~120 slow, 175 normal, 240 fast)
+        self.volume = volume        # 0.0 to 1.0
 
     # ---------- Voices ----------
     @staticmethod
@@ -95,7 +96,7 @@ class PaperNarrator:
         text = str(text)
         for old, new in SPEECH_REPLACEMENTS.items():
             text = text.replace(old, new)
-        text = re.sub(r"https?://\S+", "", text)       # URLs
+        text = re.sub(r"https?://\S+", "", text)      # URLs
         text = re.sub(r"[*#_`>|~]", "", text)          # markdown symbols
         text = re.sub(r"\s+", " ", text).strip()
         return text
@@ -166,26 +167,31 @@ class PaperNarrator:
         mode: str = MODE_SUMMARIES,
         filename: str = None,
         progress_callback=None,
-    ) -> str:
+    ) -> tuple[str, str]:
         """
-        Synthesizes the briefing to a WAV file and returns its path.
-        progress_callback(done, total) is called after each segment.
-        Works offline using the voices installed in Windows.
+        Synthesizes briefing to WAV, generates a word-timing JSON metadata file for highlighting, 
+        and returns (wav_filepath, json_filepath).
         """
         if not articles:
             raise ValueError("There are no articles to read.")
 
         if not filename:
-            filename = f"edition_{datetime.now().strftime('%Y-%m-%d')}.wav"
+            base_name = f"edition_{datetime.now().strftime('%Y-%m-%d')}"
+        else:
+            base_name = os.path.splitext(filename)[0]
 
         os.makedirs(OUTPUTS_DIR, exist_ok=True)
-        filepath = os.path.join(OUTPUTS_DIR, filename)
+        filepath = os.path.join(OUTPUTS_DIR, f"{base_name}.wav")
+        json_path = os.path.join(OUTPUTS_DIR, f"{base_name}_timing.json")
 
         segments = self.build_segments(articles, mode)
         total = len(segments)
 
         tmp_dir = tempfile.mkdtemp(prefix="chroniclex_tts_")
         part_paths = []
+        word_timings = []
+        current_time = 0.0
+
         started = time.perf_counter()
 
         try:
@@ -206,12 +212,27 @@ class PaperNarrator:
                         if not os.path.exists(part) or os.path.getsize(part) < 100:
                             raise RuntimeError(f"Voice produced no audio for segment {done}.")
 
+                        # Calculate exact audio duration of this segment using wave module
+                        with wave.open(part, "rb") as w_part:
+                            frames = w_part.getnframes()
+                            rate_Hz = w_part.getframerate()
+                            actual_seg_duration = frames / float(rate_Hz)
+
                         part_paths.append(part)
-                        words = len(segment.split())
-                        print(
-                            f"[audio] segment {done}/{total}: {words} words "
-                            f"in {time.perf_counter() - seg_start:.1f}s"
-                        )
+
+                        # Map words to timestamps for highlighting UI
+                        words = segment.split()
+                        if words:
+                            time_per_word_actual = actual_seg_duration / len(words)
+                            for w in words:
+                                start_t = current_time
+                                end_t = current_time + time_per_word_actual
+                                word_timings.append({"word": w, "start": round(start_t, 2), "end": round(end_t, 2)})
+                                current_time = end_t
+
+                        # Account for pause between segments
+                        current_time += SILENCE_BETWEEN_SEGMENTS_SEC
+
                         if progress_callback:
                             progress_callback(done, total)
                 finally:
@@ -221,8 +242,13 @@ class PaperNarrator:
                         pass
 
             self._merge_wavs(part_paths, filepath)
+            
+            # Save timing map to JSON
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump(word_timings, jf, indent=2)
+
             print(f"[audio] finished in {time.perf_counter() - started:.1f}s -> {filepath}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        return filepath
+        return filepath, json_path
