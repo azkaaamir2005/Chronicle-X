@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import time
 from collections import defaultdict
@@ -34,7 +35,7 @@ if css_path.exists():
 else:
     st.warning(f"styles.css not found at {css_path}. Using default styling.")
 
-# Custom Styling for Newspaper Aesthetic
+# Custom Styling for Newspaper Aesthetic & Word Highlighting
 st.markdown("""
     <style>
     .masthead-title {
@@ -151,18 +152,20 @@ def start_audio_job(articles, voice_id, rate, mode):
     Records the audio briefing in a background thread so the page stays usable.
     Only plain data is passed in: Streamlit session state can't be used from threads.
     """
-    job = {"status": "running", "done": 0, "total": 1, "path": None, "error": None}
+    job = {"status": "running", "done": 0, "total": 1, "path": None, "json_path": None, "error": None}
     get_audio_jobs()["current"] = job
     articles_copy = [dict(a) for a in articles]
 
     def run():
         try:
             narrator = PaperNarrator(voice_id=voice_id, rate=rate)
-            job["path"] = narrator.generate_audio(
+            wav_path, json_path = narrator.generate_audio(
                 articles_copy,
                 mode=mode,
                 progress_callback=lambda done, total: job.update(done=done, total=total),
             )
+            job["path"] = wav_path
+            job["json_path"] = json_path
             job["status"] = "done"
         except Exception as e:
             print(f"AUDIO ERROR: {type(e).__name__}: {e}")
@@ -203,10 +206,10 @@ with st.sidebar:
     # Audio options (offline voices installed in Windows)
     st.subheader("🎧 Audio Briefing")
     audio_mode = st.selectbox(
-        "Audio length",
+        "Audio length & Scope",
         options=AUDIO_MODES,
         index=AUDIO_MODES.index(MODE_SUMMARIES),
-        help="Shorter scripts record much faster. Headlines only takes a few seconds."
+        help="Choose whether to listen to headlines, summaries, or full counter-perspectives."
     )
     audio_auto = st.checkbox(
         "Record audio in the background after each paper",
@@ -346,7 +349,7 @@ if st.session_state.today_edition:
     if audio_btn:
         start_audio_job(st.session_state.today_edition, selected_voice_id, audio_rate, audio_mode)
 
-    # Audio panel: polls every 2 seconds while recording, then shows the player
+    # Audio panel: polls every 2 seconds while recording, then shows the player + live word highlighter
     current_job = get_audio_jobs().get("current")
     audio_running = bool(current_job and current_job["status"] == "running")
 
@@ -372,12 +375,53 @@ if st.session_state.today_edition:
                 f"voice is available. ({job['error']})"
             )
         elif job["status"] == "done" and job["path"] and os.path.exists(job["path"]):
-            st.markdown("**🎧 Listen to today's paper**")
+            st.markdown("---")
+            st.subheader("📻 ChronicleX Live Audio Briefing & Synchronized Word Highlighter")
+            
             with open(job["path"], "rb") as audio_file:
                 audio_bytes = audio_file.read()
             st.audio(audio_bytes, format="audio/wav")
+
+            # Load word timing metadata for word-level highlighting
+            json_meta_path = job.get("json_path")
+            if json_meta_path and os.path.exists(json_meta_path):
+                with open(json_meta_path, "r", encoding="utf-8") as jf:
+                    timing_data = json.load(jf)
+
+                # Render synchronized HTML/JS text box for live word highlighting
+                highlight_html = f"""
+                <div style="background-color: #12151c; padding: 18px; border-radius: 8px; border: 1px solid #374151; max-height: 220px; overflow-y: auto; margin-top: 10px;">
+                    <p id="transcript-box" style="font-size: 1.05em; line-height: 1.7; color: #d1d5db; font-family: monospace;">
+                        {' '.join([f'<span id="w-{i}" style="transition: color 0.1s ease;">{item["word"]}</span>' for i, item in enumerate(timing_data)])}
+                    </p>
+                </div>
+                <script>
+                    const audioEle = window.parent.document.querySelector('audio');
+                    const timings = {json.dumps(timing_data)};
+                    
+                    if (audioEle) {{
+                        audioEle.ontimeupdate = function() {{
+                            const currentTime = audioEle.currentTime;
+                            timings.forEach((t, idx) => {{
+                                const span = window.parent.document.getElementById('w-' + idx);
+                                if (span) {{
+                                    if (currentTime >= t.start && currentTime <= t.end) {{
+                                        span.style.color = '#38bdf8'; // Highlight cyan color
+                                        span.style.fontWeight = 'bold';
+                                    }} else {{
+                                        span.style.color = '#d1d5db';
+                                        span.style.fontWeight = 'normal';
+                                    }}
+                                }}
+                            }});
+                        }};
+                    }}
+                </script>
+                """
+                st.markdown(highlight_html, unsafe_allow_html=True)
+
             st.download_button(
-                label="📥 Download audio (WAV)",
+                label="📥 Download audio brief (WAV)",
                 data=audio_bytes,
                 file_name=os.path.basename(job["path"]),
                 mime="audio/wav"
